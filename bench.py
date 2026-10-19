@@ -4,6 +4,7 @@ Three ways to answer each of FinanceQA's 148 questions on Costco's 10-K, same mo
   baseline - answer from the context, like the paper
   assume   - list every input first, quoting it or stating the analyst assumption that fills it, then answer
   code     - same, but the arithmetic is written as Python and actually executed
+  examples - three expert worked solutions from the other half of the benchmark in context, tested only on held-out questions
 A different model judges every answer against AfterQuery's reference, and numeric answers get an exact check too.
 """
 import argparse, concurrent.futures as cf, datetime as dt, json, os, pathlib, re, subprocess, sys, time, urllib.request
@@ -83,7 +84,31 @@ def final_line(text):
     m = re.findall(r"final answer\s*:\s*(.+)", text, flags=re.I)
     return (m[-1] if m else text.strip().splitlines()[-1] if text.strip() else "").strip()
 
+def split(rows):
+    """Stratified halves: within each question type, alternate questions go to dev and test. Test questions never appear as examples."""
+    dev, test = [], []
+    for t in sorted({r["question_type"] for r in rows}):
+        idx = [i for i, r in enumerate(rows) if r["question_type"] == t]
+        dev += idx[0::2]; test += idx[1::2]
+    return sorted(dev), sorted(test)
+
+def words(s): return set(re.findall(r"[a-z]+", (s or "").lower())) - {"the", "a", "of", "for", "in", "is", "what", "and", "to", "year", "ending"}
+def pick_examples(row, rows, dev, k=3):
+    q = words(row["question"])
+    score = lambda j: len(q & words(rows[j]["question"])) / max(1, len(q | words(rows[j]["question"]))) + (0.1 if rows[j]["question_type"] == row["question_type"] else 0)
+    return sorted(dev, key=lambda j: -score(j))[:k]
+
+EX_HEAD = "Here are worked solutions by an expert analyst to related questions on the same 10-K:"
+def examples_instr(row, rows, dev):
+    ex = []
+    for j in pick_examples(row, rows, dev):
+        cot = rows[j]["chain_of_thought"] or ""
+        ex.append(f"Example question: {rows[j]['question']}\nExpert solution: {cot[:2500]}{' ...' if len(cot) > 2500 else ''}\nAnswer: {rows[j]['answer']}")
+    return EX_HEAD + "\n\n" + "\n\n".join(ex) + "\n\nNow answer the question the same way an expert analyst would. " + BASE_INSTR
+
+CTX = {}
 def answer(row, cond, model):
+    if cond == "examples": return final_line(llm(model, base_msgs(row, examples_instr(row, CTX["rows"], CTX["dev"]))))
     if cond == "baseline": return final_line(llm(model, base_msgs(row, BASE_INSTR)))
     if cond == "assume": return final_line(llm(model, base_msgs(row, ASSUME_INSTR)))
     raw = llm(model, base_msgs(row, CODE_INSTR), as_json=True)
@@ -104,8 +129,11 @@ def judge(row, ans, model):
     except json.JSONDecodeError: return "true" in raw.lower()
 
 NUM = re.compile(r"-?\$?\(?-?[\d,]*\.?\d+\)?%?")
-def first_number(s):
+YEAR = re.compile(r"(19|20)\d\d")
+def first_number(s, skip_years=True):
+    """The first number in the text, skipping bare years like 2024 so "for 2024 is $9,285" reads as 9,285."""
     for m in NUM.finditer(s or ""):
+        if skip_years and YEAR.fullmatch(m.group()): continue
         t = m.group().replace("$", "").replace(",", "").replace("%", "")
         neg = t.startswith("(") or t.startswith("-"); t = t.strip("()-")
         try: return (-1 if neg else 1) * float(t), m.group().endswith("%")
@@ -113,7 +141,7 @@ def first_number(s):
     return None
 def numeric_match(gold, ans):
     """Exact check for numeric references: same number within 1%, or within 0.1 points for percents. None if not numeric."""
-    g = first_number(gold); a = first_number(ans)
+    g = first_number(gold, skip_years=False); a = first_number(ans)
     if g is None or re.search(r"[A-Za-z]{4,}", re.sub(r"\(in millions\)|millions?|billions?", "", gold or "", flags=re.I)): return None
     if a is None: return False
     if g[1]: return abs(g[0] - a[0]) <= 0.1 or abs(g[0] - a[0] * 100) <= 0.1
@@ -122,7 +150,9 @@ def numeric_match(gold, ans):
 def main(n, model, judge_model, workers, conds):
     load_env()
     if not os.environ.get("OPENAI_API_KEY"): raise SystemExit("Put OPENAI_API_KEY in .env")
-    rows = dataset()[:n] if n else dataset()
+    rows = dataset(); dev, test = split(rows); CTX.update(rows=rows, dev=dev)
+    held = "examples" in conds
+    evals = (test if held else list(range(len(rows))))[: n or None]
     rawf = ROOT / "results" / "raw.json"; rawf.parent.mkdir(exist_ok=True)
     raw = json.loads(rawf.read_text(encoding="utf-8")) if rawf.exists() else {}
     def job(i, cond):
@@ -130,7 +160,7 @@ def main(n, model, judge_model, workers, conds):
         if key in raw: return key, raw[key]
         a = answer(rows[i], cond, model); return key, {"answer": a, "correct": judge(rows[i], a, judge_model), "numeric": numeric_match(rows[i]["answer"], a)}
     for cond in conds:
-        todo = [i for i in range(len(rows)) if f"{model}|{cond}|{i}" not in raw]
+        todo = [i for i in evals if f"{model}|{cond}|{i}" not in raw]
         with cf.ThreadPoolExecutor(workers) as ex:
             for k, (key, v) in enumerate(ex.map(lambda i: job(i, cond), todo), 1):
                 raw[key] = v
@@ -138,23 +168,29 @@ def main(n, model, judge_model, workers, conds):
         rawf.write_text(json.dumps(raw), encoding="utf-8")
     types = ["basic", "assumption", "conceptual"]
     def acc(cond, t=None):
-        idx = [i for i in range(len(rows)) if t is None or rows[i]["question_type"] == t]
+        idx = [i for i in evals if t is None or rows[i]["question_type"] == t]
         return sum(raw[f"{model}|{cond}|{i}"]["correct"] for i in idx) / max(1, len(idx)), len(idx)
-    names = {"baseline": "Answer directly", "assume": "State inputs and assumptions first", "code": "State inputs, compute in Python"}
+    names = {"baseline": "Answer directly", "assume": "State inputs and assumptions first", "code": "State inputs, compute in Python",
+             "examples": "Three expert worked solutions in context"}
     md = [f"# FinanceQA without fine-tuning, {dt.date.today()}", "",
-          f"{len(rows)} FinanceQA questions on Costco's 10-K. Answering model `{model}`, graded by `{judge_model}` against AfterQuery's reference answers.", "",
+          (f"Held-out half: {len(evals)} of 148 FinanceQA questions. The other half supplies the expert examples and is never tested. " if held else "") +
+          f"{len(evals)} FinanceQA questions on Costco's 10-K. Answering model `{model}`, graded by `{judge_model}` against AfterQuery's reference answers.", "",
           "| Question type | Questions | Paper, GPT-4o | " + " | ".join(names[c] for c in conds) + " |", "|---|---|---|" + "---|" * len(conds)]
     for t in types:
         n_t = acc(conds[0], t)[1]
-        md.append(f"| {t} | {n_t} | {PAPER[t]:.1%} | " + " | ".join(f"{acc(c, t)[0]:.1%}" for c in conds) + " |")
-    md.append(f"| all | {len(rows)} | | " + " | ".join(f"**{acc(c)[0]:.1%}**" for c in conds) + " |")
-    agree = [(v["correct"], v["numeric"]) for k, v in raw.items() if k.startswith(model + "|") and v["numeric"] is not None]
+        md.append(f"| {t} | {n_t} | {PAPER[t]:.1%} | " + " | ".join((f"{acc(c, t)[0]:.1%}" if n_t else "-") for c in conds) + " |")
+    md.append(f"| all | {len(evals)} | | " + " | ".join(f"**{acc(c)[0]:.1%}**" for c in conds) + " |")
+    for k, v in raw.items():                                   # recompute the exact check from cached answers, so fixes apply without new calls
+        i = int(k.split("|")[2])
+        if k.startswith(model + "|") and i in set(evals): v["numeric"] = numeric_match(rows[i]["answer"], v["answer"])
+    agree = [(v["correct"], v["numeric"]) for k, v in raw.items() if k.startswith(model + "|") and int(k.split("|")[2]) in set(evals) and v["numeric"] is not None]
     md += ["", "## Grader check", "",
            f"On the {len(agree)} graded answers with a numeric reference, the judge agreed with an exact numeric check {sum(a == b for a, b in agree) / max(1, len(agree)):.1%} of the time." if agree else "No numeric answers to cross-check.",
            "", "## Honest limits", "",
            "- One company, 148 questions, one run at temperature 0. A gap of a few questions within a type is noise, especially for the smaller types.",
            "- The paper's grading code is no longer public, so this grades with a separate judge model plus an exact numeric check. The baseline column against the paper's column is the calibration.",
            "- The prompts were written from the paper's description of the task, before looking at any reference answers, and are the same for every question.",
+           "- The expert examples come only from the dev half. All 148 questions are on the same 10-K, so a held-out question can share building blocks with a dev example, like adjusted EBITDA and adjusted EBITDA margin. That is the point of expert examples, and also why this is one company, not a general result.",
            "- The Python step runs model-written arithmetic in an isolated subprocess with a 10 second timeout and refuses anything beyond the math module."]
     out = "\n".join(md); (ROOT / "results" / f"{dt.date.today()}.md").write_text(out, encoding="utf-8"); print(out)
 

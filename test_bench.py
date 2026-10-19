@@ -34,3 +34,12 @@ raw = json.loads((tmp / "results" / "raw.json").read_text())
 assert raw["fake|code|0"]["answer"] == "$32,095 (in millions)" and raw["fake|code|0"]["correct"] is True
 assert raw["fake|baseline|0"]["correct"] is False and raw["fake|baseline|0"]["numeric"] is False
 print("all tests passed")
+# 6. Held-out split: stratified, disjoint, and examples only ever come from the dev half.
+rows2 = [{"question": f"What is adjusted EBITDA variant {i}?", "question_type": ["basic", "assumption", "conceptual"][i % 3], "chain_of_thought": "x" * 3000, "answer": str(i), "context": "c"} for i in range(30)]
+dev, test = bench.split(rows2)
+assert not set(dev) & set(test) and len(dev) + len(test) == 30
+for i in test:
+    assert set(bench.pick_examples(rows2[i], rows2, dev)) <= set(dev)
+instr = bench.examples_instr(rows2[test[0]], rows2, dev)
+assert instr.startswith(bench.EX_HEAD) and instr.count("Example question:") == 3 and " ..." in instr
+print("held-out tests passed")
