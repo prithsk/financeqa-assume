@@ -11,7 +11,32 @@ Can a prompt pipeline close FinanceQA's assumption gap without fine-tuning?
 ## Results
 
 <!-- results:start -->
-_Run it to populate._
+# FinanceQA without fine-tuning, 2026-10-19
+
+Held-out half: 74 of 148 FinanceQA questions. The other half supplies the expert examples and is never tested. 74 FinanceQA questions on Costco's 10-K. Answering model `gpt-4o`, graded by `gpt-4o-mini` against AfterQuery's reference answers.
+
+| Question type | Questions | Paper, GPT-4o | Answer directly | State inputs and assumptions first | Three expert worked solutions in context |
+|---|---|---|---|---|---|
+| basic | 19 | 44.7% | 42.1% | 36.8% | 57.9% |
+| assumption | 23 | 2.2% | 0.0% | 8.7% | 17.4% |
+| conceptual | 32 | 62.5% | 65.6% | 53.1% | 75.0% |
+| all | 74 | | **39.2%** | **35.1%** | **52.7%** |
+
+## Grader check
+
+On the 196 graded answers with a numeric reference, the judge agreed with an exact numeric check 93.4% of the time.
+
+## Honest limits
+
+- One company, 148 questions, one run at temperature 0. A gap of a few questions within a type is noise, especially for the smaller types.
+- The paper's grading code is no longer public, so this grades with a separate judge model plus an exact numeric check. The baseline column against the paper's column is the calibration.
+- The prompts were written from the paper's description of the task, before looking at any reference answers, and are the same for every question.
+- The expert examples come only from the dev half. All 148 questions are on the same 10-K, so a held-out question can share building blocks with a dev example, like adjusted EBITDA and adjusted EBITDA margin. That is the point of expert examples, and also why this is one company, not a general result.
+- The Python step runs model-written arithmetic in an isolated subprocess with a 10 second timeout and refuses anything beyond the math module.
+## Calibration on all 148 questions
+
+Answering directly, GPT-4o scored 44.7% on basic questions, the paper's exact number, and 0 of 46 on assumption questions against the paper's 1 of 46. On all 148, stating assumptions first scored 31.1% and computing in executed Python scored 24.3%, both below answering directly at 33.8%.
+
 <!-- results:end -->
 
 ## Calibration and grading
